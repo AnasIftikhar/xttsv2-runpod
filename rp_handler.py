@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Complete RunPod Handler for XTTS Voice Cloning
-Uses TTS library directly for reliability and speed
+Fixed RunPod Handler for XTTS Voice Cloning
+With automatic TOS acceptance
 """
 
 import runpod
@@ -11,6 +11,9 @@ import sys
 import traceback
 import tempfile
 from pathlib import Path
+
+# CRITICAL: Set environment variable to auto-accept Coqui TOS
+os.environ['COQUI_TOS_AGREED'] = '1'
 
 # Try to import TTS
 try:
@@ -35,7 +38,7 @@ def initialize_model():
         print("[INIT] Loading XTTS v2 model...", flush=True)
         print("[INIT] This may take 30-60 seconds on first run...", flush=True)
         
-        # Initialize TTS model
+        # Initialize TTS model (TOS auto-accepted via environment variable)
         tts_model = TTS("tts_models/multilingual/multi-dataset/xtts_v2")
         
         # Move to GPU if available
