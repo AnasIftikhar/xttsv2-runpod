@@ -1,172 +1,237 @@
 #!/usr/bin/env python3
 """
-RunPod Serverless Handler for XTTS API Server
-This handler starts the XTTS server and proxies requests to it
+Complete RunPod Handler for XTTS Voice Cloning
+Uses TTS library directly for reliability and speed
 """
 
 import runpod
-import subprocess
-import time
-import requests
-import os
 import base64
-from threading import Thread
+import os
+import sys
+import traceback
+import tempfile
+from pathlib import Path
 
-# Global variables
-server_process = None
-server_ready = False
+# Try to import TTS
+try:
+    from TTS.api import TTS
+    print("[INIT] TTS library imported successfully", flush=True)
+except ImportError as e:
+    print(f"[ERROR] Failed to import TTS library: {e}", flush=True)
+    sys.exit(1)
 
-def start_xtts_server():
-    """Start XTTS API server in background"""
-    global server_process, server_ready
+# Global variable for TTS model
+tts_model = None
+
+def initialize_model():
+    """Initialize the XTTS model"""
+    global tts_model
     
-    print("🚀 Starting XTTS API server...")
-    
-    cmd = [
-        "python3", "-m", "xtts_api_server",
-        "--host", "0.0.0.0",
-        "--port", "8020",
-        "--use-cache",
-        "--deepspeed"
-    ]
+    print("="*70, flush=True)
+    print("🎵 XTTS RunPod Handler - Initializing", flush=True)
+    print("="*70, flush=True)
     
     try:
-        server_process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1
-        )
+        print("[INIT] Loading XTTS v2 model...", flush=True)
+        print("[INIT] This may take 30-60 seconds on first run...", flush=True)
         
-        # Monitor server startup
-        max_wait = 90
-        waited = 0
+        # Initialize TTS model
+        tts_model = TTS("tts_models/multilingual/multi-dataset/xtts_v2")
         
-        while waited < max_wait:
-            try:
-                response = requests.get("http://localhost:8020/docs", timeout=3)
-                if response.status_code == 200:
-                    server_ready = True
-                    print("✅ XTTS API server is ready!")
-                    return True
-            except:
-                pass
-            
-            time.sleep(3)
-            waited += 3
-            
-            if waited % 15 == 0:
-                print(f"⏳ Waiting for server... ({waited}s/{max_wait}s)")
+        # Move to GPU if available
+        if tts_model.is_cuda_available:
+            print("[INIT] CUDA is available, moving model to GPU...", flush=True)
+            tts_model = tts_model.to("cuda")
+            print("[INIT] ✅ Model loaded on GPU", flush=True)
+        else:
+            print("[INIT] ⚠️  CUDA not available, using CPU (slower)", flush=True)
         
-        print("❌ Server failed to start within timeout")
-        return False
+        print("="*70, flush=True)
+        print("✅ XTTS Model loaded successfully!", flush=True)
+        print("="*70, flush=True)
+        
+        return True
         
     except Exception as e:
-        print(f"❌ Error starting server: {e}")
+        print(f"[ERROR] Failed to initialize model: {e}", flush=True)
+        traceback.print_exc()
         return False
 
 def handler(event):
     """
-    Main RunPod handler function
+    Main handler function for TTS generation
     
-    Input format:
+    Expected input format:
     {
         "input": {
-            "text": "Text to convert to speech",
-            "speaker_wav": "URL or path to speaker voice sample (optional)",
-            "language": "en" (default),
-            "temperature": 0.75,
-            "speed": 1.0
+            "text": "Text to convert to speech (required)",
+            "speaker_wav": "Base64 encoded audio for voice cloning (optional)",
+            "language": "en" (default, supports: en, es, fr, de, it, pt, pl, tr, ru, nl, cs, ar, zh-cn, ja, ko, hi)
         }
     }
     
-    Returns audio as base64 encoded string
+    Returns:
+    {
+        "audio": "Base64 encoded WAV audio",
+        "content_type": "audio/wav",
+        "size_bytes": 12345
+    }
     """
-    global server_ready
     
-    # Check if server is ready
-    if not server_ready:
+    global tts_model
+    
+    # Check if model is initialized
+    if tts_model is None:
+        print("[ERROR] Model not initialized", flush=True)
         return {
-            "error": "Server is still initializing. Please wait a moment and try again.",
-            "server_ready": False
+            "error": "Model not initialized. Please wait and try again.",
+            "status": "model_not_ready"
         }
     
     try:
-        # Extract input
+        # Extract input data
         input_data = event.get("input", {})
         
-        # Validate required fields
+        # Get required parameter
         text = input_data.get("text", "").strip()
         if not text:
-            return {"error": "Missing required parameter: 'text'"}
+            return {
+                "error": "Missing required parameter: 'text'",
+                "status": "invalid_input"
+            }
         
-        # Build request payload with defaults
-        payload = {
-            "text": text,
-            "speaker_wav": input_data.get("speaker_wav", ""),
-            "language": input_data.get("language", "en"),
-            "temperature": input_data.get("temperature", 0.75),
-            "length_penalty": input_data.get("length_penalty", 1.0),
-            "repetition_penalty": input_data.get("repetition_penalty", 5.0),
-            "top_k": input_data.get("top_k", 50),
-            "top_p": input_data.get("top_p", 0.85),
-            "speed": input_data.get("speed", 1.0)
-        }
+        # Get optional parameters
+        speaker_wav_b64 = input_data.get("speaker_wav", "")
+        language = input_data.get("language", "en")
         
-        print(f"🎤 Generating TTS for: '{text[:50]}...'")
+        print(f"[REQUEST] Generating TTS", flush=True)
+        print(f"[REQUEST] Text length: {len(text)} characters", flush=True)
+        print(f"[REQUEST] Language: {language}", flush=True)
+        print(f"[REQUEST] Voice cloning: {'Yes' if speaker_wav_b64 else 'No'}", flush=True)
         
-        # Call XTTS API
-        response = requests.post(
-            "http://localhost:8020/tts_to_audio/",
-            json=payload,
-            timeout=120
-        )
+        # Create temporary output file
+        with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp_output:
+            output_path = tmp_output.name
         
-        if response.status_code == 200:
-            # Encode audio to base64
-            audio_base64 = base64.b64encode(response.content).decode('utf-8')
+        # Handle voice cloning if speaker audio is provided
+        speaker_path = None
+        if speaker_wav_b64:
+            try:
+                print("[CLONING] Processing speaker audio...", flush=True)
+                
+                # Remove data URL prefix if present
+                if "," in speaker_wav_b64 and speaker_wav_b64.startswith("data:"):
+                    speaker_wav_b64 = speaker_wav_b64.split(",", 1)[1]
+                
+                # Decode base64 audio
+                speaker_bytes = base64.b64decode(speaker_wav_b64)
+                
+                # Save to temporary file
+                with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp_speaker:
+                    speaker_path = tmp_speaker.name
+                    tmp_speaker.write(speaker_bytes)
+                
+                print(f"[CLONING] Speaker audio decoded ({len(speaker_bytes)} bytes)", flush=True)
+                
+            except Exception as e:
+                print(f"[ERROR] Failed to process speaker audio: {e}", flush=True)
+                return {
+                    "error": f"Invalid speaker_wav: {str(e)}",
+                    "status": "invalid_speaker_audio"
+                }
+        
+        # Generate speech
+        try:
+            print("[TTS] Generating audio...", flush=True)
             
-            print(f"✅ Audio generated successfully ({len(response.content)} bytes)")
+            if speaker_path:
+                # Voice cloning mode
+                tts_model.tts_to_file(
+                    text=text,
+                    file_path=output_path,
+                    speaker_wav=speaker_path,
+                    language=language
+                )
+            else:
+                # Default voice mode
+                tts_model.tts_to_file(
+                    text=text,
+                    file_path=output_path,
+                    language=language
+                )
+            
+            print("[TTS] ✅ Audio generation complete", flush=True)
+            
+        except Exception as e:
+            print(f"[ERROR] TTS generation failed: {e}", flush=True)
+            traceback.print_exc()
+            return {
+                "error": f"TTS generation failed: {str(e)}",
+                "status": "generation_failed"
+            }
+        
+        # Read generated audio
+        try:
+            with open(output_path, "rb") as audio_file:
+                audio_bytes = audio_file.read()
+            
+            # Encode to base64
+            audio_b64 = base64.b64encode(audio_bytes).decode('utf-8')
+            
+            print(f"[SUCCESS] Audio generated: {len(audio_bytes)} bytes", flush=True)
+            
+            # Cleanup temporary files
+            try:
+                os.unlink(output_path)
+                if speaker_path:
+                    os.unlink(speaker_path)
+            except:
+                pass
             
             return {
-                "audio": audio_base64,
-                "content_type": response.headers.get('content-type', 'audio/wav'),
+                "audio": audio_b64,
+                "content_type": "audio/wav",
+                "size_bytes": len(audio_bytes),
                 "text_length": len(text),
-                "audio_size_bytes": len(response.content)
-            }
-        else:
-            return {
-                "error": f"TTS generation failed (HTTP {response.status_code})",
-                "details": response.text[:500]
+                "language": language,
+                "voice_cloned": bool(speaker_wav_b64),
+                "status": "success"
             }
             
-    except requests.Timeout:
-        return {"error": "Request timeout. Text might be too long."}
+        except Exception as e:
+            print(f"[ERROR] Failed to read output audio: {e}", flush=True)
+            return {
+                "error": f"Failed to read output: {str(e)}",
+                "status": "read_failed"
+            }
+    
     except Exception as e:
-        return {"error": f"Handler error: {str(e)}"}
+        print(f"[ERROR] Unexpected error in handler: {e}", flush=True)
+        traceback.print_exc()
+        return {
+            "error": f"Handler error: {str(e)}",
+            "status": "handler_error"
+        }
 
-# Initialize
+# Main execution
 if __name__ == "__main__":
-    print("=" * 60)
-    print("🎵 XTTS RunPod Serverless Handler")
-    print("=" * 60)
+    print("\n" + "="*70, flush=True)
+    print("🚀 Starting XTTS RunPod Serverless Handler", flush=True)
+    print("="*70 + "\n", flush=True)
     
-    # Start server in background thread
-    server_thread = Thread(target=start_xtts_server, daemon=True)
-    server_thread.start()
+    # Initialize the model
+    if not initialize_model():
+        print("[FATAL] Model initialization failed. Exiting...", flush=True)
+        sys.exit(1)
     
-    # Wait for server with timeout
-    server_thread.join(timeout=120)
+    print("\n" + "="*70, flush=True)
+    print("🎉 Handler is ready and waiting for requests!", flush=True)
+    print("="*70 + "\n", flush=True)
     
-    if not server_ready:
-        print("❌ CRITICAL: Server failed to initialize")
-        print("Check logs above for errors")
-        exit(1)
-    
-    print("\n" + "=" * 60)
-    print("🎉 Handler ready - starting RunPod serverless")
-    print("=" * 60 + "\n")
-    
-    # Start RunPod handler
-    runpod.serverless.start({"handler": handler})
+    # Start RunPod serverless handler
+    try:
+        runpod.serverless.start({"handler": handler})
+    except Exception as e:
+        print(f"[FATAL] Failed to start RunPod handler: {e}", flush=True)
+        traceback.print_exc()
+        sys.exit(1)
