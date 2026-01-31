@@ -7,6 +7,9 @@ ENV CUDA_HOME=/usr/local/cuda
 ENV PATH=${CUDA_HOME}/bin:${PATH}
 ENV LD_LIBRARY_PATH=${CUDA_HOME}/lib64:${LD_LIBRARY_PATH}
 
+# CRITICAL: Auto-accept Coqui TTS Terms of Service
+ENV COQUI_TOS_AGREED=1
+
 # Install system dependencies
 RUN apt-get update && apt-get install -y \
     python3.10 \
@@ -45,8 +48,8 @@ RUN pip3 install --no-cache-dir \
     inflect \
     unidecode
 
-# Pre-download the XTTS model to speed up cold starts
-RUN python3 -c "from TTS.api import TTS; print('Downloading XTTS v2 model...'); tts = TTS('tts_models/multilingual/multi-dataset/xtts_v2', gpu=False); print('Model cached successfully!')" || echo "Model will be downloaded on first run"
+# Pre-download the XTTS model (TOS will be auto-accepted via env variable)
+RUN python3 -c "from TTS.api import TTS; print('Downloading XTTS v2 model...'); tts = TTS('tts_models/multilingual/multi-dataset/xtts_v2', gpu=False); print('Model cached successfully!')"
 
 # Create necessary directories
 RUN mkdir -p /app /tmp/tts_cache
@@ -60,12 +63,8 @@ COPY rp_handler.py /app/rp_handler.py
 # Make handler executable
 RUN chmod +x /app/rp_handler.py
 
-# Expose port (for documentation purposes, not required for serverless)
+# Expose port (for documentation purposes)
 EXPOSE 8020
-
-# Health check (optional, helps with debugging)
-HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
-    CMD python3 -c "import sys; sys.exit(0)" || exit 1
 
 # Run the handler
 CMD ["python3", "-u", "/app/rp_handler.py"]
